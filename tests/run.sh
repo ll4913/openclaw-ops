@@ -124,7 +124,11 @@ case "${1:-}" in
           if [[ -n "${OPENCLAW_CRON_STATE_FILE:-}" && -f "${OPENCLAW_CRON_STATE_FILE:-}" ]]; then
             cat "$OPENCLAW_CRON_STATE_FILE"
           else
-            printf '%s\n' "${OPENCLAW_CRON_LIST_JSON:-{\"jobs\":[]}}"
+            if [[ -n "${OPENCLAW_CRON_LIST_JSON:-}" ]]; then
+              printf '%s\n' "$OPENCLAW_CRON_LIST_JSON"
+            else
+              printf '{"jobs":[]}\n'
+            fi
           fi
         fi
         exit 0
@@ -1416,6 +1420,102 @@ PY
   assert_contains "$none" "No context files at or above 10000 tokens found for agent scout."
 }
 
+
+
+test_workspace_auto_commit_commits_dirty_repo_and_audit_reports_coverage() {
+  setup_fake_env
+
+  local repo="$TEST_ROOT/workspace alpha"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email "test@example.com"
+  git -C "$repo" config user.name "Test User"
+  printf 'first\n' >"$repo/file.txt"
+  git -C "$repo" add file.txt
+  git -C "$repo" commit -q -m "initial"
+  printf 'second\n' >>"$repo/file.txt"
+
+  dry_output="$(bash "$ROOT_DIR/scripts/workspace-auto-commit.sh" --workspace "$repo" --label alpha --dry-run 2>&1)"
+  assert_contains "$dry_output" "status: dirty"
+  assert_contains "$dry_output" "dry-run: would commit"
+
+  output="$(bash "$ROOT_DIR/scripts/workspace-auto-commit.sh" --workspace "$repo" --label alpha 2>&1)"
+  assert_contains "$output" "status: committed"
+  assert_contains "$output" "auto: hourly alpha snapshot"
+  assert_eq "$(git -C "$repo" status --short --untracked-files=all | wc -l | tr -d ' ')" "0"
+  assert_contains "$(git -C "$repo" log -1 --pretty=%s)" "auto: hourly alpha snapshot"
+
+  OPENCLAW_CRON_LIST_JSON="$(python3 - "$ROOT_DIR" "$repo" <<'PY'
+import json
+import sys
+
+root, repo = sys.argv[1:]
+print(json.dumps({
+    "jobs": [{
+        "name": "alpha-auto-commit",
+        "payload": {
+            "message": f"bash -l -c '{root}/scripts/workspace-auto-commit.sh --workspace {repo} --label alpha'"
+        },
+    }]
+}))
+PY
+)"
+  export OPENCLAW_CRON_LIST_JSON
+  audit_output="$(bash "$ROOT_DIR/scripts/workspace-git-audit.sh" --path "$repo" 2>&1)"
+  assert_contains "$audit_output" "auto-commit cron covered: 1"
+
+  unset OPENCLAW_CRON_LIST_JSON
+  suggestion_output="$(bash "$ROOT_DIR/scripts/workspace-git-audit.sh" --path "$repo" --show-cron 2>&1 || true)"
+  assert_contains "$suggestion_output" "Suggested cron for $repo"
+  assert_contains "$suggestion_output" "workspace-auto-commit.sh"
+  assert_contains "$suggestion_output" "$repo"
+
+  local cron_command
+  local cron_log="$TEST_ROOT/cron-add.log"
+  cron_command="$(printf '%s\n' "$suggestion_output" | grep '^openclaw cron add ')"
+  OPENCLAW_CALL_LOG="$cron_log" bash -c "$cron_command"
+  assert_contains "$(cat "$cron_log")" "$repo"
+}
+
+test_workspace_git_audit_cron_matching_is_per_job_and_strict_controls_exit() {
+  setup_fake_env
+
+  local repo="$TEST_ROOT/workspace beta"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email "test@example.com"
+  git -C "$repo" config user.name "Test User"
+  printf 'first\n' >"$repo/file.txt"
+  git -C "$repo" add file.txt
+  git -C "$repo" commit -q -m "initial"
+
+  OPENCLAW_CRON_LIST_JSON="$(python3 - "$repo" <<'PY'
+import json
+import sys
+
+repo = sys.argv[1]
+print(json.dumps({
+    "jobs": [
+        {"name": "mentions-path", "payload": {"message": f"echo {repo}"}},
+        {"name": "mentions-script", "payload": {"message": "bash scripts/workspace-auto-commit.sh --workspace /tmp/other"}},
+    ]
+}))
+PY
+)"
+  export OPENCLAW_CRON_LIST_JSON
+  local audit_output
+  audit_output="$(bash "$ROOT_DIR/scripts/workspace-git-audit.sh" --path "$repo" 2>&1)"
+  assert_contains "$audit_output" "auto-commit cron covered: 0"
+
+  if bash "$ROOT_DIR/scripts/workspace-git-audit.sh" --path "$repo" --strict >/tmp/workspace-git-audit-strict.out 2>&1; then
+    fail "expected --strict audit to fail when cron coverage is missing"
+  fi
+
+  unset OPENCLAW_CRON_LIST_JSON
+  audit_output="$(bash "$ROOT_DIR/scripts/workspace-git-audit.sh" --path "$repo" 2>&1)"
+  assert_contains "$audit_output" "auto-commit cron covered: 0"
+}
+
 test_daily_digest_summarizes_incidents_activity_and_watchdog() {
   setup_fake_env
   trap teardown_fake_env RETURN
@@ -1486,5 +1586,7 @@ run_test test_remediation_board_imports_and_tracks_cron_errors
 run_test test_agent_dirs_audit_classifies_and_mutates_candidates
 run_test test_backup_rotate_groups_and_prunes_old_backups
 run_test test_context_audit_filters_thresholds_and_agent_scope
+run_test test_workspace_auto_commit_commits_dirty_repo_and_audit_reports_coverage
+run_test test_workspace_git_audit_cron_matching_is_per_job_and_strict_controls_exit
 run_test test_daily_digest_summarizes_incidents_activity_and_watchdog
 printf 'All openclaw-ops tests passed\n'
