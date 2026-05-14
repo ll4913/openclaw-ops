@@ -80,19 +80,69 @@ workspace_slug() {
   fi
 }
 
+shell_join() {
+  python3 - "$@" <<'PY'
+import shlex
+import sys
+
+print(shlex.join(sys.argv[1:]))
+PY
+}
+
+cron_covers_path() {
+  local cron_json="$1"
+  local path="$2"
+  [[ -n "$cron_json" ]] || return 1
+
+  printf '%s' "$cron_json" | python3 -c '
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    payload = json.load(sys.stdin)
+except json.JSONDecodeError:
+    sys.exit(1)
+
+if isinstance(payload, list):
+    jobs = payload
+elif isinstance(payload, dict):
+    jobs = payload.get("jobs", payload.get("crons", []))
+else:
+    jobs = []
+
+for job in jobs:
+    haystack = json.dumps(job, ensure_ascii=False)
+    if path in haystack and (
+        "workspace-auto-commit.sh" in haystack or "git commit" in haystack
+    ):
+        sys.exit(0)
+
+sys.exit(1)
+' "$path"
+}
+
 print_cron_suggestion() {
   local path="$1"
   local slug="$2"
   local minute="$3"
   local script="$AUTO_COMMIT_SCRIPT"
+  local exec_command
+  local bash_command
+  local message
+  local cron_expr
+  local cron_command
+
+  exec_command="$(shell_join "$script" --workspace "$path" --label "$slug")"
+  bash_command="$(shell_join bash -l -c "$exec_command")"
+  message="$(printf 'Run local git auto-commit for %s. Use exactly one exec call: %s. Output exactly NO_REPLY regardless of result.' "$path" "$bash_command")"
+  cron_expr="${minute} * * * *"
+  cron_command="$(shell_join openclaw cron add --name "${slug}-auto-commit" --cron "$cron_expr" --session isolated --no-deliver --light-context --timeout-seconds 120 --message "$message")"
+
   cat <<EOF
 
 Suggested cron for $path:
-openclaw cron add --name ${slug}-auto-commit --cron '${minute} * * * *' --session isolated --no-deliver --light-context --timeout-seconds 120 --message "Run local git auto-commit for ${path}. Use exactly one exec call:
-
-bash -l -c '${script} --workspace ${path} --label ${slug}'
-
-Output exactly NO_REPLY regardless of result."
+$cron_command
 EOF
 }
 
@@ -116,11 +166,14 @@ for path in "${paths[@]}"; do
     dirty_count="$(git -C "$expanded" status --short --untracked-files=all | wc -l | tr -d ' ')"
     last_commit="$(git -C "$expanded" log -1 --pretty='%h %ad %s' --date='format:%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || true)"
   fi
-  if [[ -n "$cron_text" ]] && [[ "$cron_text" == *"$expanded"* ]] && { [[ "$cron_text" == *"workspace-auto-commit.sh"* ]] || [[ "$cron_text" == *"git commit"* ]]; }; then
+  if cron_covers_path "$cron_text" "$expanded"; then
     cron_covered=1
   fi
 
-  if [[ "$exists" -ne 1 || "$is_repo" -ne 1 || "$cron_covered" != "1" ]]; then
+  if [[ "$exists" -ne 1 || "$is_repo" -ne 1 ]]; then
+    status=1
+  fi
+  if [[ "$strict" -eq 1 && "$cron_covered" != "1" ]]; then
     status=1
   fi
   if [[ "$strict" -eq 1 && "${dirty_count:-0}" != "0" ]]; then
