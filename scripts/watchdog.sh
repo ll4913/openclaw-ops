@@ -13,11 +13,15 @@ HEAL_SCRIPT="$(cd "$(dirname "$0")" && pwd)/heal.sh"
 SESSION_MONITOR_SCRIPT="${OPENCLAW_SESSION_MONITOR_SCRIPT:-$(cd "$(dirname "$0")" && pwd)/session-monitor.sh}"
 SESSION_MONITOR_STAMP="${OPENCLAW_SESSION_MONITOR_STAMP:-$HOME/.openclaw/session-monitor/watchdog.stamp}"
 SESSION_MONITOR_THROTTLE=600
+WATCHDOG_LOCK_DIR="${OPENCLAW_WATCHDOG_LOCK_DIR:-$HOME/.openclaw/watchdog.lock}"
+WATCHDOG_LOCK_TTL=600
 MAX_RESTART_ATTEMPTS=3
 RESTART_ATTEMPT_WINDOW=900  # 15 minutes
 HEALTH_FAILURE_WINDOW=600    # require repeated unhealthy probes within 10 minutes
 REQUIRED_HEALTH_FAILURES=2
 GATEWAY_WARMUP_GRACE=120     # do not restart a young gateway during startup
+STARTUP_GRACE_SECONDS=300
+RESTART_WAIT_SECONDS=90
 STATE_FILE="$HOME/.openclaw/watchdog-state.json"
 RUN_LOCK_DIR="$HOME/.openclaw/watchdog.lock"
 
@@ -27,11 +31,121 @@ mkdir -p "$(dirname "$STATE_FILE")"
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $1" | tee -a "$LOG_FILE"; }
 
+acquire_watchdog_lock() {
+  if mkdir "$WATCHDOG_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" >"$WATCHDOG_LOCK_DIR/pid" 2>/dev/null || true
+    trap 'rm -rf "$WATCHDOG_LOCK_DIR"' EXIT
+    return 0
+  fi
+
+  local lock_mtime now
+  now="$(epoch_now)"
+  lock_mtime="$(file_mtime "$WATCHDOG_LOCK_DIR" || true)"
+  lock_mtime="${lock_mtime:-0}"
+  if (( now - lock_mtime > WATCHDOG_LOCK_TTL )); then
+    log "Removing stale watchdog lock age=$((now - lock_mtime))s"
+    rm -rf "$WATCHDOG_LOCK_DIR"
+    if mkdir "$WATCHDOG_LOCK_DIR" 2>/dev/null; then
+      printf '%s\n' "$$" >"$WATCHDOG_LOCK_DIR/pid" 2>/dev/null || true
+      trap 'rm -rf "$WATCHDOG_LOCK_DIR"' EXIT
+      return 0
+    fi
+  fi
+
+  log "Another watchdog/heal run is active; skipping this tick"
+  exit 0
+}
+
+gateway_pid_info() {
+  pgrep -af "openclaw-gateway|/openclaw/dist/index\\.js gateway|/openclaw .* gateway --port" 2>/dev/null | grep -v "grep" | head -1 || true
+}
+
+gateway_process_age_seconds() {
+  local pid="$1"
+  local age etime days rest h m s
+  [[ -n "$pid" ]] || return 1
+  age="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  if [[ "$age" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$age"
+    return 0
+  fi
+
+  # macOS ps does not support etimes. Fall back to parsing etime:
+  # [[dd-]hh:]mm:ss.
+  etime="$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  [[ -n "$etime" ]] || return 1
+  days=0
+  rest="$etime"
+  if [[ "$rest" == *-* ]]; then
+    days="${rest%%-*}"
+    rest="${rest#*-}"
+  fi
+  IFS=: read -r h m s <<<"$rest"
+  if [[ -z "${s:-}" ]]; then
+    s="$m"
+    m="$h"
+    h=0
+  fi
+  [[ "$days" =~ ^[0-9]+$ && "$h" =~ ^[0-9]+$ && "$m" =~ ^[0-9]+$ && "$s" =~ ^[0-9]+$ ]] || return 1
+  # Force base-10 parsing so macOS etime values like 08:09 do not trip
+  # bash's octal interpretation in arithmetic expansion.
+  printf '%s\n' $((10#$days * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s))
+}
+
+gateway_is_starting() {
+  local info pid age
+  info="$(gateway_pid_info)"
+  [[ -n "$info" ]] || return 1
+  pid="${info%% *}"
+  age="$(gateway_process_age_seconds "$pid")"
+  [[ "$age" =~ ^[0-9]+$ ]] || return 1
+  (( age < STARTUP_GRACE_SECONDS ))
+}
+
+wait_for_gateway_http() {
+  local deadline status
+  deadline=$(( $(epoch_now) + RESTART_WAIT_SECONDS ))
+  while (( $(epoch_now) < deadline )); do
+    status=$(gateway_health_status || true)
+    if [[ "$status" == "200" ]] || [[ "$status" == "401" ]]; then
+      printf '%s\n' "$status"
+      return 0
+    fi
+    if gateway_is_starting; then
+      sleep 5
+      continue
+    fi
+    sleep 3
+  done
+  printf '%s\n' "${status:-000}"
+  return 1
+}
+
+gateway_health_status() {
+  local status
+  status=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 30 "$GATEWAY_URL" 2>/dev/null || echo "000")
+  if [[ "$status" == "200" ]] || [[ "$status" == "401" ]]; then
+    printf '%s\n' "$status"
+    return 0
+  fi
+
+  # Some installs intentionally bind the gateway only to a tailnet address.
+  # In that mode 127.0.0.1 health checks fail even when the gateway is healthy.
+  if openclaw gateway status >/dev/null 2>&1; then
+    printf '%s\n' "200"
+    return 0
+  fi
+
+  printf '%s\n' "$status"
+  return 1
+}
+
 # Trim log to last 500 lines
 if [[ -f "$LOG_FILE" ]]; then
   tail -500 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
 fi
 
+acquire_watchdog_lock
 log "── Watchdog tick ────────────────────"
 
 acquire_run_lock() {
@@ -269,7 +383,7 @@ check_agent_layer_health() {
 GATEWAY_PORT="$(get_gateway_port)"
 GATEWAY_URL="http://127.0.0.1:${GATEWAY_PORT}/health"
 
-HTTP_STATUS=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 15 "$GATEWAY_URL" 2>/dev/null || echo "000")
+HTTP_STATUS=$(gateway_health_status || true)
 
 if [[ "$HTTP_STATUS" == "200" ]] || [[ "$HTTP_STATUS" == "401" ]]; then
   # 401 = gateway is up, auth token required (expected in normal operation)
@@ -307,6 +421,11 @@ fi
 
 # ── Gateway is down ───────────────────────────────────────────────────────────
 log "Gateway unreachable (HTTP $HTTP_STATUS)"
+
+if gateway_is_starting; then
+  log "Gateway process is still inside startup grace (${STARTUP_GRACE_SECONDS}s); deferring restart"
+  exit 0
+fi
 
 GATEWAY_PID="$(gateway_pid)"
 if [[ -n "$GATEWAY_PID" ]]; then
@@ -347,12 +466,10 @@ fi
 log "Attempting gateway restart (attempt $((RESTART_COUNT + 1)) of $MAX_RESTART_ATTEMPTS)"
 record_restart
 
-openclaw gateway restart 2>>"$LOG_FILE" &
-RESTART_PID=$!
-sleep 8
+openclaw gateway restart 2>>"$LOG_FILE" || true
 
 # Verify it came back up
-HTTP_STATUS_AFTER=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 15 "$GATEWAY_URL" 2>/dev/null || echo "000")
+HTTP_STATUS_AFTER=$(wait_for_gateway_http || true)
 
 if [[ "$HTTP_STATUS_AFTER" == "200" ]] || [[ "$HTTP_STATUS_AFTER" == "401" ]]; then
   log "Gateway recovered (HTTP $HTTP_STATUS_AFTER)"
@@ -361,6 +478,11 @@ if [[ "$HTTP_STATUS_AFTER" == "200" ]] || [[ "$HTTP_STATUS_AFTER" == "401" ]]; t
     osascript -e 'display notification "OpenClaw gateway restarted successfully." with title "OpenClaw Watchdog" subtitle "Recovered"' 2>/dev/null || true
   fi
   maybe_run_session_monitor
+  exit 0
+fi
+
+if gateway_is_starting; then
+  log "Gateway restart is still inside startup grace after ${RESTART_WAIT_SECONDS}s; deferring heal.sh"
   exit 0
 fi
 
@@ -373,7 +495,7 @@ else
 fi
 
 # Final check
-HTTP_FINAL=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 15 "$GATEWAY_URL" 2>/dev/null || echo "000")
+HTTP_FINAL=$(wait_for_gateway_http || true)
 if [[ "$HTTP_FINAL" == "200" ]] || [[ "$HTTP_FINAL" == "401" ]]; then
   log "Gateway recovered after heal.sh"
   clear_restarts
