@@ -1,8 +1,16 @@
 # openclaw-ops
 
-OpenClaw gateway operations skill for agent environments. Covers health checks, repair workflows, continuous monitoring, session analysis, update-change detection, and security review for a local or self-hosted OpenClaw install.
+Unified OpenClaw operations skill for agent environments and **Cursor Automations**. Combines self-healing scripts with deep maintenance references (synced from Hermes `openclaw-system-maintenance`).
+
+**v2.0.0:** orchestrator `SKILL.md` + [daily-runbook.md](daily-runbook.md) for scheduled ops reviews.
 
 Tested against OpenClaw `2026.5.4`.
+
+## Daily ops (Cursor Automation)
+
+1. Commit and push this repo (automation checks out from GitHub).
+2. Create a **local** scheduled automation that reads `daily-runbook.md`.
+3. Refresh references after Hermes updates: `bash scripts/sync-from-hermes.sh`
 
 ## What it does
 

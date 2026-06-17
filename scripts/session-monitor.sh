@@ -153,9 +153,10 @@ max_retry_streak = {}
 last_failed_tool = None
 current_streak = 0
 
-auth_pattern = re.compile(r"401|403|unauthorized|forbidden|token.{0,20}expired", re.IGNORECASE)
+auth_pattern = re.compile(r"(?<![A-Za-z0-9])(?:401|403)(?![A-Za-z0-9])|unauthorized|forbidden|token.{0,20}expired", re.IGNORECASE)
 error_pattern = re.compile(r"error:|failed|traceback|permission denied|cannot proceed|unable to|i apologize", re.IGNORECASE)
 stale_session_window = 86400
+identity_notice_pattern = re.compile(r"^\s*(?:⚙️\s*)?Session ids resolved\.\s+acpx session id:\s+\S+\s+acpx record id:\s+\S+\s*$", re.IGNORECASE | re.DOTALL)
 
 for record in records:
     if record.get("type") == "message":
@@ -179,6 +180,8 @@ for record in records:
             if any(chunk.strip() for chunk in text_chunks):
                 meaningful_assistant_count += 1
                 joined = "\n".join(text_chunks)
+                if identity_notice_pattern.match(joined):
+                    continue
                 if error_pattern.search(joined):
                     error_like_count += 1
                 if auth_pattern.search(joined):
